@@ -275,6 +275,132 @@ TEST(ftoa_test, no_overrun) {
   EXPECT_EQ(buffer[zmij::float_buffer_size], '?');
 }
 
+#if !ZMIJ_C
+// ---- to_decimal(value, dtoa_mode, ndigits) ------------------------------
+//
+// The new overload implements CPython-compatible rounding modes:
+//   dtoa_mode::shortest    - same output as the one-arg to_decimal.
+//   dtoa_mode::significant - round to N significant digits.
+//   dtoa_mode::fractional  - round to N digits past the decimal point
+//                            (N may be negative).
+// Trailing zeros are always stripped; `decpt = exp + num_digits` gives the
+// classic _Py_dg_dtoa decimal-point position.
+
+using zmij::dtoa_mode;
+
+// Packs a dec_fp into a compact string so EXPECT_EQ failures are readable.
+auto dec_fp_str(zmij::dec_fp d) -> std::string {
+  if (d.exp == zmij::non_finite_exp)
+    return std::string(d.negative ? "-" : "+") +
+           (d.sig == 0 ? "inf" : "nan(" + std::to_string(d.sig) + ")");
+  return std::string(d.negative ? "-" : "+") + std::to_string(d.sig) + "e" +
+         std::to_string(d.exp);
+}
+
+auto fp(long long sig, int exp, bool neg = false) -> std::string {
+  return dec_fp_str(zmij::dec_fp{sig, exp, neg});
+}
+
+auto round_ex(double v, dtoa_mode m, int n = 0) -> std::string {
+  return dec_fp_str(zmij::to_decimal(v, m, n));
+}
+
+TEST(to_decimal_mode, shortest_matches_existing) {
+  // Mode 0 must reproduce the shortest-form output of the one-arg overload
+  // (after the one-arg overload's trailing-zero strip is applied).
+  EXPECT_EQ(round_ex(1.0, dtoa_mode::shortest), fp(1, 0));
+  EXPECT_EQ(round_ex(0.1, dtoa_mode::shortest), fp(1, -1));
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::shortest), fp(125, -3));
+  EXPECT_EQ(round_ex(5.0507837461e-27, dtoa_mode::shortest),
+            fp(50507837461LL, -37));
+}
+
+TEST(to_decimal_mode, shortest_zero_and_nonfinite) {
+  EXPECT_EQ(round_ex(0.0, dtoa_mode::shortest), fp(0, 0));
+  EXPECT_EQ(round_ex(-0.0, dtoa_mode::shortest), fp(0, 0, true));
+  EXPECT_EQ(round_ex(0.0, dtoa_mode::fractional, 5), fp(0, 0));
+  // inf/nan pass through regardless of mode.
+  auto inf = std::numeric_limits<double>::infinity();
+  auto r = zmij::to_decimal(inf, dtoa_mode::fractional, 3);
+  EXPECT_EQ(r.exp, zmij::non_finite_exp);
+  EXPECT_EQ(r.sig, 0);
+  EXPECT_FALSE(r.negative);
+}
+
+TEST(to_decimal_mode, significant) {
+  // 0.125 has shortest "125"; any ndigits >= 3 leaves it alone.
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::significant, 5), fp(125, -3));
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::significant, 3), fp(125, -3));
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::significant, 2), fp(12, -2));  // 0.12
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::significant, 1), fp(1, -1));   // 0.1
+
+  // ndigits <= 0 is treated as 1 (like _Py_dg_dtoa).
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::significant, 0), fp(1, -1));
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::significant, -7), fp(1, -1));
+
+  // The literal 9.95 is the double 9.94999999... (9.95 isn't exactly
+  // representable); correct bit-exact rounding at 2 sig digits yields 9.9,
+  // not 10.0. This is the case where the old shortest-then-round path
+  // disagreed with _Py_dg_dtoa by 1 ulp.
+  EXPECT_EQ(round_ex(9.95, dtoa_mode::significant, 2), fp(99, -1));
+  // 9.5 is exactly representable; 2 sig digits is 9.5 unchanged.
+  EXPECT_EQ(round_ex(9.5, dtoa_mode::significant, 2), fp(95, -1));
+  // Genuine carry: 99.5 at 2 sig digits ties to even -> 100.
+  EXPECT_EQ(round_ex(99.5, dtoa_mode::significant, 2), fp(1, 2));
+  // 1.2345 literal is the double 1.23449999... (slightly below rational
+  // 1.2345); bit-exact 4-sig-digit rounding picks 1.234.
+  EXPECT_EQ(round_ex(1.2345, dtoa_mode::significant, 4), fp(1234, -3));
+}
+
+TEST(to_decimal_mode, fractional_positive_ndigits) {
+  // 0.125 to 2 fractional digits: ties at 0.125 between 0.12 and 0.13,
+  // last kept digit should be even -> 0.12.
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::fractional, 2), fp(12, -2));
+  // 3 or more frac digits: shortest already covers it; exp stays at -3.
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::fractional, 3), fp(125, -3));
+  EXPECT_EQ(round_ex(0.125, dtoa_mode::fractional, 10), fp(125, -3));
+
+  // 1.5 with 0 frac digits: ties at 1.5 between 1 and 2; even is 2.
+  EXPECT_EQ(round_ex(1.5, dtoa_mode::fractional, 0), fp(2, 0));
+  EXPECT_EQ(round_ex(2.5, dtoa_mode::fractional, 0), fp(2, 0));
+  EXPECT_EQ(round_ex(-1.5, dtoa_mode::fractional, 0), fp(2, 0, true));
+}
+
+TEST(to_decimal_mode, fractional_negative_ndigits) {
+  // Round 15 to the tens place -> 20 (ties to even, 2 is even).
+  EXPECT_EQ(round_ex(15.0, dtoa_mode::fractional, -1), fp(2, 1));
+  EXPECT_EQ(round_ex(45.0, dtoa_mode::fractional, -1), fp(4, 1));  // 40
+  EXPECT_EQ(round_ex(55.0, dtoa_mode::fractional, -1), fp(6, 1));  // 60
+  EXPECT_EQ(round_ex(50.0, dtoa_mode::fractional, -1), fp(5, 1));  // 50
+
+  // Rounding entirely below the requested scale.
+  EXPECT_EQ(round_ex(15.0, dtoa_mode::fractional, -2), fp(0, 0));  // 0
+  EXPECT_EQ(round_ex(50.0, dtoa_mode::fractional, -2), fp(0, 0));  // 50 ties -> 0
+  EXPECT_EQ(round_ex(51.0, dtoa_mode::fractional, -2), fp(1, 2));  // 100
+  EXPECT_EQ(round_ex(500.0, dtoa_mode::fractional, -3), fp(0, 0)); // 500 ties -> 0
+
+  // Sign is preserved on a "round to zero" result.
+  EXPECT_EQ(round_ex(-15.0, dtoa_mode::fractional, -2), fp(0, 0, true));
+  EXPECT_EQ(round_ex(-51.0, dtoa_mode::fractional, -2), fp(1, 2, true));
+}
+
+TEST(to_decimal_mode, fractional_carry_across_digit_boundary) {
+  // 9.5 -> 10 at 0 frac digits (carry increases digit count).
+  EXPECT_EQ(round_ex(9.5, dtoa_mode::fractional, 0), fp(1, 1));   // 10
+  // 99.5 -> 100.
+  EXPECT_EQ(round_ex(99.5, dtoa_mode::fractional, 0), fp(1, 2));  // 100
+  // 0.99 at 1 frac digit -> 1.0.
+  EXPECT_EQ(round_ex(0.99, dtoa_mode::fractional, 1), fp(1, 0));
+}
+
+TEST(to_decimal_mode, fractional_subnormals_and_tiny) {
+  // Denormal min is about 5e-324; coarser rounding should collapse it to 0.
+  double tiny = std::numeric_limits<double>::denorm_min();
+  EXPECT_EQ(round_ex(tiny, dtoa_mode::fractional, 5), fp(0, 0));
+  EXPECT_EQ(round_ex(tiny, dtoa_mode::fractional, -1), fp(0, 0));
+}
+#endif  // !ZMIJ_C
+
 auto main(int argc, char** argv) -> int {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

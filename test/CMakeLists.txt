@@ -4,7 +4,9 @@ add_library(dragonbox dragonbox/dragonbox_to_chars.cpp)
 target_include_directories(dragonbox PUBLIC .)
 
 function (add_zmij_test name)
-  add_executable(${name} zmij-test.cc)
+  # The Ryu port defines zmij::ryu::{d2fixed,d2exp}_buffered_n and is declared
+  # (but not defined) inside zmij.cc; every test TU needs it linked in.
+  add_executable(${name} zmij-test.cc ../_ryu/d2fixed.cc)
   target_compile_features(${name} PRIVATE ${ZMIJ_STANDARD})
   target_link_libraries(${name} dragonbox gtest)
   add_test(NAME ${name} COMMAND ${name})

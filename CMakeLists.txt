@@ -3,7 +3,7 @@ project(zmij CXX)
 
 set(ZMIJ_STANDARD cxx_std_14)
 
-add_library(zmij zmij.cc zmij.h)
+add_library(zmij zmij.cc zmij.h _ryu/d2fixed.cc _ryu/ryu.h)
 target_include_directories(zmij PUBLIC .)
 target_compile_features(zmij PRIVATE ${ZMIJ_STANDARD})
 
