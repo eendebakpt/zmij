@@ -1148,6 +1148,360 @@ inline auto to_decimal(double value) noexcept -> dec_fp {
   return {dec.sig * 10 + last_digit, dec.exp, negative};
 }
 
+}  // namespace zmij
+
+#include "_ryu/ryu.h"
+
+namespace zmij {
+namespace {
+
+// Parses Ryu's `d2fixed_buffered_n` output ("ddd[.ddd]") into a dec_fp with
+// trailing zeros stripped. `negative` is threaded through separately — we
+// always hand Ryu |value|, so the buffer has no leading '-'.
+auto parse_d2fixed(const char* s, int n, bool negative) noexcept -> dec_fp {
+  int dot = -1;
+  for (int i = 0; i < n; ++i) if (s[i] == '.') { dot = i; break; }
+  int int_len  = (dot < 0) ? n : dot;
+  int frac_len = (dot < 0) ? 0 : (n - dot - 1);
+
+  int first_nz = 0;
+  while (first_nz < int_len && s[first_nz] == '0') ++first_nz;
+  int frac_first_nz = 0;
+  if (first_nz == int_len) {
+    while (frac_first_nz < frac_len && s[dot + 1 + frac_first_nz] == '0')
+      ++frac_first_nz;
+  }
+
+  auto digit_at = [&](int i) -> char {
+    return (i < int_len) ? s[i] : s[i + 1];  // skip '.' for positions past it
+  };
+  int trail_end = int_len + frac_len;
+  while (trail_end > 0 && digit_at(trail_end - 1) == '0') --trail_end;
+
+  int digit_start = (first_nz == int_len) ? int_len + frac_first_nz : first_nz;
+  if (digit_start >= trail_end) return {0, 0, negative};
+
+  long long sig = 0;
+  for (int i = digit_start; i < trail_end; ++i)
+    sig = sig * 10 + (digit_at(i) - '0');
+  int decpt = (first_nz == int_len) ? -frac_first_nz : (int_len - first_nz);
+  int num_digits = trail_end - digit_start;
+  return {sig, decpt - num_digits, negative};
+}
+
+// Parses Ryu's `d2exp_buffered_n` output ("d[.ddd]e[+-]dd[d]") into a dec_fp
+// with trailing zeros stripped. We trim trailing zeros *before* accumulating
+// into `long long` so a request like d2exp(1e20, 19) — which produces 20
+// digits, each either `1` or `0` — doesn't overflow the int64 sig.
+auto parse_d2exp(const char* s, int n, bool negative) noexcept -> dec_fp {
+  int e_pos = -1;
+  for (int i = 0; i < n; ++i) if (s[i] == 'e') { e_pos = i; break; }
+  // Parse the exponent first so we know `decpt`.
+  int sign_exp = (s[e_pos + 1] == '-') ? -1 : 1;
+  int exp_abs = 0;
+  for (int i = e_pos + 2; i < n; ++i) exp_abs = exp_abs * 10 + (s[i] - '0');
+  int decpt = sign_exp * exp_abs + 1;
+
+  // Walk the mantissa ignoring '.', find its last non-zero position.
+  int mantissa_len = 0;
+  for (int i = 0; i < e_pos; ++i) if (s[i] != '.') ++mantissa_len;
+  int last_nz = -1;
+  int idx = 0;
+  for (int i = 0; i < e_pos; ++i) {
+    if (s[i] == '.') continue;
+    if (s[i] != '0') last_nz = idx;
+    ++idx;
+  }
+  if (last_nz < 0) return {0, 0, negative};  // all-zero mantissa (unreachable)
+
+  // Accumulate digits up to and including `last_nz`; trailing zeros are
+  // absorbed into the exponent via `sig * 10^exp = value`.
+  long long sig = 0;
+  idx = 0;
+  for (int i = 0; i < e_pos && idx <= last_nz; ++i) {
+    if (s[i] == '.') continue;
+    sig = sig * 10 + (s[i] - '0');
+    ++idx;
+  }
+  int num_digits = last_nz + 1;
+  int exp = decpt - num_digits;
+  return {sig, exp, negative};
+}
+
+// CPython mode-3 `ilim == 0` tail: rounds at position 10^(-ndigits), which
+// sits at or just above the leading digit of |value|. Result is either 0 or
+// ±10^(-ndigits). Compares the shortest's mantissa against 5 * 10^(num_sh-1)
+// (where num_sh = digits of shortest) — this is equivalent to comparing the
+// double against the halfway threshold T = 5 * 10^(-ndigits-1).
+//
+// When shortest == "5" (single digit), T might not be exactly representable
+// (for -ndigits-1 > 22), in which case the double is the nearest-double-to-T
+// and the sign of (value - T) is decided by Ryu's exact expansion.
+auto mode3_tail(double abs_value, int ndigits, dec_fp shortest) noexcept
+    -> dec_fp {
+  bool neg = shortest.negative;
+  int num_sh = 0;
+  for (long long x = shortest.sig; x != 0; x /= 10) ++num_sh;
+
+  // Build rhs = 5 * 10^(num_sh - 1) so that `shortest.sig <=> rhs` has the
+  // same sign as (value - T) (as rationals). rhs fits in int64_t because
+  // num_sh <= 17 for a double's shortest.
+  long long rhs = 5;
+  for (int i = 1; i < num_sh; ++i) rhs *= 10;
+
+  if (shortest.sig < rhs) return {0, 0, neg};              // below halfway
+  if (shortest.sig > rhs) return {1, -ndigits, neg};       // above halfway
+
+  // shortest.sig == rhs AND shortest's sig has exactly 1 digit after strip
+  // (since rhs == 5 happens only when num_sh == 1). Then shortest == "5" and
+  // shortest.exp places it at the right decade. If -ndigits-1 <= 22, the
+  // rational 5 * 10^(-ndigits-1) is exactly representable and value == it
+  // exactly — true tie, rounds to even (0). Otherwise fall back to comparing
+  // via 21-digit Ryu expansion of the double.
+  int target_decade = -ndigits - 1;
+  if (target_decade <= 22) return {0, 0, neg};
+
+  // Ryu docs bound `d2fixed`/`d2exp` output at ~2000 chars (worst case for
+  // doubles: 325 integer digits plus large precision).
+  char buf[2048];
+  int len = ryu::d2exp_buffered_n(abs_value, 20, buf);
+  // Look for any non-zero digit beyond position 0 in the mantissa.
+  int e_pos = 0;
+  while (e_pos < len && buf[e_pos] != 'e') ++e_pos;
+  // Scan digits [1, e_pos) for non-zero, skipping the '.'.
+  bool any_nonzero = false;
+  for (int i = 1; i < e_pos; ++i) {
+    if (buf[i] != '0' && buf[i] != '.') { any_nonzero = true; break; }
+  }
+  // Ryu's 20-digit rounded mantissa would be "5.000...0" iff the double
+  // rounds to exactly 5 * 10^target_decade at 21 digits — which for a
+  // not-exactly-representable target means the double sits within a 20-digit
+  // ulp of T. That's still ambiguous, but distances of that tiny magnitude
+  // (> 10^-37 relative) are indistinguishable in double precision, so
+  // treating as tie is safe.
+  return any_nonzero ? dec_fp{1, -ndigits, neg} : dec_fp{0, 0, neg};
+}
+
+}  // namespace
+
+inline auto to_decimal(double value, dtoa_mode mode, int ndigits) noexcept
+    -> dec_fp {
+  // Fast paths delegated to the shortest code: inf/nan and zero.
+  dec_fp s = to_decimal(value);
+  if (s.exp == non_finite_exp) return s;
+  if (s.sig == 0) return {0, 0, s.negative};
+  if (mode == dtoa_mode::shortest) {
+    while (s.sig % 10 == 0) { s.sig /= 10; ++s.exp; }
+    return s;
+  }
+
+  // Work on |value|: Ryu emits no leading '-' when fed a non-negative double,
+  // which keeps the parser simple.
+  double abs_value = s.negative ? -value : value;
+  // Ryu docs bound `d2fixed`/`d2exp` output at ~2000 chars (worst case for
+  // doubles: 325 integer digits plus large precision).
+  char buf[2048];
+
+  if (mode == dtoa_mode::significant) {
+    int N = ndigits >= 1 ? ndigits : 1;
+    int len = ryu::d2exp_buffered_n(abs_value, uint32_t(N - 1), buf);
+    return parse_d2exp(buf, len, s.negative);
+  }
+
+  // mode == fractional.
+  if (ndigits >= 0) {
+    int len = ryu::d2fixed_buffered_n(abs_value, uint32_t(ndigits), buf);
+    return parse_d2fixed(buf, len, s.negative);
+  }
+
+  // Negative ndigits: we want `ilim = k + ndigits + 1` significant digits,
+  // where k = floor(log10(|value|)) pre-rounding. k comes from the shortest —
+  // it's exact for magnitude, since rounding across a decade is reflected in
+  // shortest's decpt.
+  int num_digits_shortest = 0;
+  for (long long x = s.sig; x != 0; x /= 10) ++num_digits_shortest;
+  int k = s.exp + num_digits_shortest - 1;
+  int ilim = k + ndigits + 1;
+  if (ilim >= 1) {
+    int len = ryu::d2exp_buffered_n(abs_value, uint32_t(ilim - 1), buf);
+    return parse_d2exp(buf, len, s.negative);
+  }
+  if (ilim < 0) return {0, 0, s.negative};
+  // ilim == 0: halfway compare at 10^(-ndigits-1).
+  // Pass the shortest in; it already has sig stripped of trailing zeros.
+  dec_fp stripped = s;
+  while (stripped.sig % 10 == 0) { stripped.sig /= 10; ++stripped.exp; }
+  return mode3_tail(abs_value, ndigits, stripped);
+}
+
+// ---- string-based dtoa ----
+//
+// Shares the algorithmic path with `to_decimal(mode, ndigits)` but writes the
+// full digit string into a caller-provided buffer, so callers can consume
+// arbitrary-length results (e.g. `format(1e300, '.-8f')`).
+
+namespace {
+
+// Rewrites a "d[.ddd]e[+-]dd[d]" buffer in place into a bare digit string with
+// trailing zeros stripped, returning (digits_len, decpt).
+struct strip_result {
+  int digits_len;
+  int decpt;
+};
+strip_result strip_d2exp(char* buf, int n) noexcept {
+  int e_pos = 0;
+  while (e_pos < n && buf[e_pos] != 'e') ++e_pos;
+  int sign_exp = (buf[e_pos + 1] == '-') ? -1 : 1;
+  int exp_abs = 0;
+  for (int i = e_pos + 2; i < n; ++i) exp_abs = exp_abs * 10 + (buf[i] - '0');
+  int decpt = sign_exp * exp_abs + 1;
+
+  // Squash '.' out of the mantissa by shifting left.
+  int w = 0;
+  for (int i = 0; i < e_pos; ++i) if (buf[i] != '.') buf[w++] = buf[i];
+  // Strip trailing zeros.
+  while (w > 1 && buf[w - 1] == '0') --w;
+  return {w, decpt};
+}
+
+// Same for "ddd[.ddd]" (d2fixed output).
+strip_result strip_d2fixed(char* buf, int n) noexcept {
+  int dot = -1;
+  for (int i = 0; i < n; ++i) if (buf[i] == '.') { dot = i; break; }
+  int int_len = (dot < 0) ? n : dot;
+  int frac_len = (dot < 0) ? 0 : (n - dot - 1);
+
+  int first_nz = 0;
+  while (first_nz < int_len && buf[first_nz] == '0') ++first_nz;
+  int frac_first_nz = 0;
+  if (first_nz == int_len) {
+    while (frac_first_nz < frac_len && buf[dot + 1 + frac_first_nz] == '0')
+      ++frac_first_nz;
+  }
+
+  // Squash '.' out by shifting left.
+  int w = 0;
+  for (int i = 0; i < n; ++i) if (buf[i] != '.') buf[w++] = buf[i];
+  // Drop leading zeros.
+  int digit_start = (first_nz == int_len) ? int_len + frac_first_nz : first_nz;
+  int digit_end = w;
+  while (digit_end > digit_start && buf[digit_end - 1] == '0') --digit_end;
+
+  int digits_len = digit_end - digit_start;
+  if (digits_len <= 0) {
+    // All zeros after strip. Caller distinguishes "true zero input" from
+    // "rounded to zero at target precision" and supplies the right decpt.
+    return {0, 0};
+  }
+  // Shift the digits down to buffer start.
+  if (digit_start > 0) {
+    for (int i = 0; i < digits_len; ++i) buf[i] = buf[digit_start + i];
+  }
+  int decpt = (first_nz == int_len) ? -frac_first_nz : (int_len - first_nz);
+  return {digits_len, decpt};
+}
+
+// Fills `buffer` with the digit sequence of a dec_fp's sig (no trailing
+// zeros, no sign). Caller must have stripped trailing zeros from sig already.
+int digits_of_sig(long long sig, char* buffer) noexcept {
+  // sig > 0 is assumed; sig==0 is handled before calling.
+  char tmp[24];
+  int n = 0;
+  while (sig > 0) {
+    tmp[n++] = char('0' + sig % 10);
+    sig /= 10;
+  }
+  for (int i = 0; i < n; ++i) buffer[i] = tmp[n - 1 - i];
+  return n;
+}
+
+}  // namespace
+
+inline auto dtoa(double value, dtoa_mode mode, int ndigits, char* buffer) noexcept
+    -> dtoa_result {
+  dtoa_result r{};
+
+  dec_fp s = to_decimal(value);
+  r.negative = s.negative;
+  if (s.exp == non_finite_exp) {
+    r.finite = false;
+    const char* text = (s.sig == 0) ? "Infinity" : "NaN";
+    int n = 0;
+    while (text[n]) { buffer[n] = text[n]; ++n; }
+    r.digits_len = n;
+    r.decpt = 9999;
+    return r;
+  }
+  r.finite = true;
+  if (s.sig == 0) {
+    buffer[0] = '0';
+    r.digits_len = 1;
+    r.decpt = 1;
+    return r;
+  }
+  // Strip trailing zeros on the shortest so we have a canonical mantissa.
+  while (s.sig % 10 == 0) { s.sig /= 10; ++s.exp; }
+
+  if (mode == dtoa_mode::shortest) {
+    int n = digits_of_sig(s.sig, buffer);
+    r.digits_len = n;
+    r.decpt = s.exp + n;
+    return r;
+  }
+
+  double abs_value = s.negative ? -value : value;
+
+  if (mode == dtoa_mode::significant) {
+    int N = ndigits >= 1 ? ndigits : 1;
+    int n = ryu::d2exp_buffered_n(abs_value, uint32_t(N - 1), buffer);
+    auto sr = strip_d2exp(buffer, n);
+    r.digits_len = sr.digits_len;
+    r.decpt = sr.decpt;
+    return r;
+  }
+
+  // mode == fractional.
+  if (ndigits >= 0) {
+    int n = ryu::d2fixed_buffered_n(abs_value, uint32_t(ndigits), buffer);
+    auto sr = strip_d2fixed(buffer, n);
+    r.digits_len = sr.digits_len;
+    // strip_d2fixed returns digits_len=0 to signal "rounded to zero"; we then
+    // use cpython's no_digits convention (empty digits, decpt = -ndigits).
+    r.decpt = sr.digits_len == 0 ? -ndigits : sr.decpt;
+    return r;
+  }
+
+  // Negative ndigits: compute ilim = k + ndigits + 1.
+  int num_sh = 0;
+  for (long long x = s.sig; x != 0; x /= 10) ++num_sh;
+  int k = s.exp + num_sh - 1;
+  int ilim = k + ndigits + 1;
+  if (ilim >= 1) {
+    int n = ryu::d2exp_buffered_n(abs_value, uint32_t(ilim - 1), buffer);
+    auto sr = strip_d2exp(buffer, n);
+    r.digits_len = sr.digits_len;
+    r.decpt = sr.decpt;
+    return r;
+  }
+  if (ilim < 0) {
+    // Rounds to zero at the target scale; cpython's no_digits semantics.
+    r.digits_len = 0;
+    r.decpt = -ndigits;
+    return r;
+  }
+  // ilim == 0: halfway decision at 10^(-ndigits-1). Reuse the dec_fp path.
+  dec_fp tail = mode3_tail(abs_value, ndigits, s);
+  if (tail.sig == 0) {
+    r.digits_len = 0;
+    r.decpt = -ndigits;
+  } else {
+    buffer[0] = '1';
+    r.digits_len = 1;
+    r.decpt = -ndigits + 1;
+  }
+  return r;
+}
+
 namespace detail {
 
 // It is slightly faster to return a pointer to the end than the size.
