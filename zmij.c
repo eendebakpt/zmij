@@ -2988,6 +2988,62 @@ static ZMIJ_INLINE char* do_write(uint64_t bin_sig, int64_t bin_exp,
 #endif  // ZMIJ_USE_EXP_STRING_TABLE
 }
 
+zmij_decimal zmij_to_decimal(double value) {
+  uint64_t bits = double_to_bits(value);
+  int64_t bin_exp = double_get_exp(bits);   // binary exponent
+  uint64_t bin_sig = double_get_sig(bits);  // binary significand
+  zmij_decimal result;
+  result.negative = double_is_negative(bits);
+  if (ZMIJ_UNLIKELY(bin_exp == 0 || bin_exp == double_exp_mask)) {
+    if (bin_exp != 0) {  // inf or nan
+      result.sig = bin_sig;
+      result.exp = zmij_nonfinite_exp;
+      return result;
+    }
+    if (bin_sig == 0) {
+      result.sig = 0;
+      result.exp = 0;
+      return result;
+    }
+    bin_exp = 1;  // subnormal
+    bin_sig |= double_implicit_bit;
+  }
+  to_decimal_result dec = to_decimal_double(bin_sig ^ double_implicit_bit,
+                                            bin_exp, bin_sig != 0, &static_data);
+  int last_digit = -(int)dec.has_last_digit & dec.last_digit;
+  result.sig = (uint64_t)dec.sig * 10 + (uint64_t)last_digit;
+  result.exp = dec.exp;
+  return result;
+}
+
+zmij_decimal zmij_to_decimal_f(float value) {
+  uint32_t bits = float_to_bits(value);
+  int64_t bin_exp = float_get_exp(bits);   // binary exponent
+  uint32_t bin_sig = float_get_sig(bits);  // binary significand
+  zmij_decimal result;
+  result.negative = float_is_negative(bits);
+  if (ZMIJ_UNLIKELY(bin_exp == 0 || bin_exp == float_exp_mask)) {
+    if (bin_exp != 0) {  // inf or nan
+      result.sig = bin_sig;
+      result.exp = zmij_nonfinite_exp;
+      return result;
+    }
+    if (bin_sig == 0) {
+      result.sig = 0;
+      result.exp = 0;
+      return result;
+    }
+    bin_exp = 1;  // subnormal
+    bin_sig |= float_implicit_bit;
+  }
+  to_decimal_result dec = to_decimal_float(bin_sig ^ float_implicit_bit,
+                                           bin_exp, bin_sig != 0, &static_data);
+  int last_digit = -(int)dec.has_last_digit & dec.last_digit;
+  result.sig = (uint64_t)dec.sig * 10 + (uint64_t)last_digit;
+  result.exp = dec.exp;
+  return result;
+}
+
 char* zmij_detail_write_f(float value, char* buffer) {
   uint32_t bits = float_to_bits(value);
   int64_t bin_exp = float_get_exp(bits);   // binary exponent

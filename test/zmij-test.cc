@@ -33,6 +33,22 @@ template <> struct buffer_sizes<double> {
   static const size_t hex = zmij_double_hex_buffer_size;
 };
 
+template <typename Sig = uint64_t> struct dec_fp {
+  Sig sig;
+  int exp;
+  bool negative;
+};
+enum { nonfinite_exp = zmij_nonfinite_exp };
+
+auto to_decimal(double value) noexcept -> dec_fp<> {
+  zmij_decimal dec = zmij_to_decimal(value);
+  return {dec.sig, dec.exp, dec.negative};
+}
+auto to_decimal(float value) noexcept -> dec_fp<> {
+  zmij_decimal dec = zmij_to_decimal_f(value);
+  return {dec.sig, dec.exp, dec.negative};
+}
+
 auto write(char* out, size_t n, double value) noexcept -> char* {
   return zmij_write(out, n, value);
 }
@@ -186,31 +202,6 @@ TEST(float_test, to_chars) {
   EXPECT_EQ(std::string(small, sizeof(small)), "1.?");
 }
 
-TEST(float_test, to_decimal) {
-  zmij::dec_fp<> dec = zmij::to_decimal(6.62607e-34f);
-  EXPECT_EQ(dec.sig, 66260700);
-  EXPECT_EQ(dec.exp, -41);
-  EXPECT_EQ(dec.negative, false);
-
-  dec = zmij::to_decimal(-1.5f);
-  EXPECT_EQ(dec.sig, 15000000);
-  EXPECT_EQ(dec.exp, -7);
-  EXPECT_EQ(dec.negative, true);
-
-  dec = zmij::to_decimal(-0.0f);
-  EXPECT_EQ(dec.sig, 0);
-  EXPECT_EQ(dec.exp, 0);
-  EXPECT_EQ(dec.negative, true);
-
-  uint32_t garlic = 0;
-  memcpy(&garlic, "🧄", 4);
-  uint32_t bits = 0x7F800000 | (garlic & 0x7FFFFF);
-  float garlic_nan = 0;
-  memcpy(&garlic_nan, &bits, sizeof(bits));
-  dec = zmij::to_decimal(garlic_nan);
-  EXPECT_EQ(dec.exp, zmij::nonfinite_exp);
-  EXPECT_EQ(dec.sig, garlic & 0x7FFFFF);
-}
 
 TEST(float_test, to_chars_format) {
   char buffer[zmij::buffer_sizes<float>::fixed];
@@ -259,6 +250,32 @@ TEST(float_test, to_chars_format) {
   EXPECT_EQ(shortest(zmij::chars_format::general, 1234567.0f), "1234567");
 }
 #endif  // !ZMIJ_C
+
+TEST(float_test, to_decimal) {
+  zmij::dec_fp<> dec = zmij::to_decimal(6.62607e-34f);
+  EXPECT_EQ(dec.sig, 66260700);
+  EXPECT_EQ(dec.exp, -41);
+  EXPECT_EQ(dec.negative, false);
+
+  dec = zmij::to_decimal(-1.5f);
+  EXPECT_EQ(dec.sig, 15000000);
+  EXPECT_EQ(dec.exp, -7);
+  EXPECT_EQ(dec.negative, true);
+
+  dec = zmij::to_decimal(-0.0f);
+  EXPECT_EQ(dec.sig, 0);
+  EXPECT_EQ(dec.exp, 0);
+  EXPECT_EQ(dec.negative, true);
+
+  uint32_t garlic = 0;
+  memcpy(&garlic, "🧄", 4);
+  uint32_t bits = 0x7F800000 | (garlic & 0x7FFFFF);
+  float garlic_nan = 0;
+  memcpy(&garlic_nan, &bits, sizeof(bits));
+  dec = zmij::to_decimal(garlic_nan);
+  EXPECT_EQ(dec.exp, zmij::nonfinite_exp);
+  EXPECT_EQ(dec.sig, garlic & 0x7FFFFF);
+}
 
 TEST(float_test, write_precision) {
   EXPECT_EQ(to_scientific(1.5f, 1), "1.5e+00");
@@ -445,6 +462,32 @@ TEST(double_test, boundaries) {
   }
 }
 
+// to_decimal must agree with the shortest text output on the same boundary
+// doubles: the digits of sig (trailing zeros dropped) placed at exp.
+TEST(double_test, to_decimal_boundaries) {
+  for (uint64_t bits : boundary_bits) {
+    double value = 0;
+    memcpy(&value, &bits, sizeof(value));
+    zmij::dec_fp<> dec = zmij::to_decimal(value);
+    ASSERT_NE(dec.exp, zmij::nonfinite_exp);
+    std::string digits = std::to_string(dec.sig);
+    int exp = dec.exp;
+    while (digits.size() > 1 && digits.back() == '0') {
+      digits.pop_back();
+      ++exp;
+    }
+    int lead_exp = exp + int(digits.size()) - 1;
+    std::string expected = digits.substr(0, 1);
+    if (digits.size() > 1) expected += "." + digits.substr(1);
+    expected += fmt::format("e{:+03d}", lead_exp);
+    char buffer[zmij::buffer_sizes<double>::scientific];
+    char* end = zmij::write_scientific(buffer, sizeof(buffer), std::fabs(value),
+                                       int(digits.size()) - 1);
+    EXPECT_EQ(std::string(buffer, end), expected) << "bits=" << bits;
+    EXPECT_EQ(dec.negative, std::signbit(value));
+  }
+}
+
 TEST(double_test, fixed_with_zeros) {
   EXPECT_EQ(to_shortest(43210.0), "43210");
   EXPECT_EQ(to_shortest(43210.1), "43210.1");
@@ -589,6 +632,8 @@ TEST(double_test, to_chars_large_precision) {
   EXPECT_EQ(std::string(small, sizeof(small)), "1.500");
 }
 
+#endif  // !ZMIJ_C
+
 TEST(double_test, to_decimal) {
   zmij::dec_fp<> dec = zmij::to_decimal(6.62607015e-34);
   EXPECT_EQ(dec.sig, 66260701500000000);
@@ -613,7 +658,6 @@ TEST(double_test, to_decimal) {
   dec = zmij::to_decimal(garlic_nan);
   EXPECT_EQ(dec.sig, garlic);
 }
-#endif  // !ZMIJ_C
 
 TEST(double_test, write_precision) {
   EXPECT_EQ(to_scientific(1.5, 1), "1.5e+00");

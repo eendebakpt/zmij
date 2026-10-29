@@ -7,8 +7,10 @@
 #ifndef ZMIJ_C_H_
 #define ZMIJ_C_H_
 
-#include <stddef.h>  // size_t
-#include <string.h>  // memcpy
+#include <stdbool.h>  // bool
+#include <stddef.h>   // size_t
+#include <stdint.h>   // uint64_t
+#include <string.h>   // memcpy
 
 // Implementation details, use the zmij_write functions instead.
 char* zmij_detail_write_f(float value, char* buffer);
@@ -26,6 +28,24 @@ char* zmij_detail_write_fixed(double value, char* buffer, int precision);
 size_t zmij_detail_write_fixed_big(char* out, size_t n, double value,
                                    int precision);
 char* zmij_detail_write_hex(double value, char* buffer);
+
+// A decimal floating-point number (negative ? -1 : 1) * sig * pow(10, exp).
+// If exp is zmij_nonfinite_exp then the number is a NaN or an infinity and sig
+// holds the raw binary significand.
+typedef struct zmij_decimal {
+  uint64_t sig;   // significand
+  int exp;        // exponent
+  bool negative;
+} zmij_decimal;
+
+enum { zmij_nonfinite_exp = 2147483647 };
+
+/// Converts `value` into the shortest correctly rounded decimal
+/// representation, as a number rather than text. Usage:
+///   zmij_decimal dec = zmij_to_decimal(6.62607015e-34);
+///   // dec.sig == 662607015, dec.exp == -42, dec.negative == false
+zmij_decimal zmij_to_decimal(double value);
+zmij_decimal zmij_to_decimal_f(float value);
 
 enum {
   // Minimum buffer sizes for zmij_write and zmij_write_f.
